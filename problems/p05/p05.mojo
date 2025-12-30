@@ -19,7 +19,8 @@ fn broadcast_add(
     row = thread_idx.y
     col = thread_idx.x
     # FILL ME IN (roughly 2 lines)
-
+    if row < size and col < size:
+        output[col*size+row] = a[row] + b[col]
 
 # ANCHOR_END: broadcast_add
 def main():
