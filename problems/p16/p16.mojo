@@ -6,6 +6,8 @@ from gpu.host import DeviceContext
 from gpu import thread_idx, block_idx, block_dim, barrier
 from gpu.memory import AddressSpace
 from layout import Layout, LayoutTensor
+from gpu.memory import async_copy_wait_all
+from layout.layout_tensor import copy_dram_to_sram_async
 
 
 comptime TPB = 3
@@ -27,6 +29,14 @@ fn naive_matmul[
     col = block_dim.x * block_idx.x + thread_idx.x
     # FILL ME IN (roughly 6 lines)
 
+    if row < size and col < size:
+        var temp : output.element_type = 0
+        @parameter
+        for idx in range(size):
+            temp += a[row, idx] * b[idx, col]
+        output[row, col] = temp
+
+
 
 # ANCHOR_END: naive_matmul
 
@@ -44,7 +54,31 @@ fn single_block_matmul[
     local_row = thread_idx.y
     local_col = thread_idx.x
     # FILL ME IN (roughly 12 lines)
+    shared_a = LayoutTensor[
+        dtype,
+        Layout.row_major(SIZE, SIZE),
+        MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ].stack_allocation()
+    shared_b = LayoutTensor[
+        dtype,
+        Layout.row_major(SIZE, SIZE),
+        MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ].stack_allocation()
 
+    if row < size and col < size:
+        shared_a[row, col] = a[row, col]
+        shared_b[row, col] = b[row, col]
+    
+    barrier()
+
+    if row < size and col < size:
+        var temp : output.element_type = 0
+        @parameter
+        for idx in range(size):
+            temp += shared_a[row, idx] * shared_b[idx, col]
+        output[row, col] = temp
 
 # ANCHOR_END: single_block_matmul
 
@@ -54,6 +88,8 @@ comptime BLOCKS_PER_GRID_TILED = (3, 3)  # each block convers 3x3 elements
 comptime THREADS_PER_BLOCK_TILED = (TPB, TPB)
 comptime layout_tiled = Layout.row_major(SIZE_TILED, SIZE_TILED)
 
+comptime NUM_THREADS = TPB * TPB
+comptime BLOCK_DIM_COUNT = 2
 
 fn matmul_tiled[
     layout: Layout, size: UInt
@@ -67,7 +103,61 @@ fn matmul_tiled[
     tiled_row = block_idx.y * TPB + thread_idx.y
     tiled_col = block_idx.x * TPB + thread_idx.x
     # FILL ME IN (roughly 20 lines)
+    # Get the tile of the output matrix that this thread block is responsible for
+    out_tile = output.tile[TPB, TPB](Int(block_idx.y), Int(block_idx.x))
+    a_shared = LayoutTensor[
+        dtype,
+        Layout.row_major(TPB, TPB),
+        MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ].stack_allocation()
+    b_shared = LayoutTensor[
+        dtype,
+        Layout.row_major(TPB, TPB),
+        MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ].stack_allocation()
 
+    var acc: output.element_type = 0
+
+    comptime load_a_layout = Layout.row_major(1, TPB)  # Coalesced loading
+    comptime load_b_layout = Layout.row_major(1, TPB)  # Coalesced loading
+    # Note: Both matrices stored in same orientation for correct matrix multiplication
+    # Transposed loading would be useful if B were pre-transposed in global memory
+
+    @parameter
+    for idx in range(size // TPB):  # Perfect division: 9 // 3 = 3 tiles
+        # Get tiles from A and B matrices
+        a_tile = a.tile[TPB, TPB](Int(block_idx.y), Int(idx))
+        b_tile = b.tile[TPB, TPB](Int(idx), Int(block_idx.x))
+
+        # Asynchronously copy tiles to shared memory with consistent orientation
+        copy_dram_to_sram_async[
+            thread_layout=load_a_layout,
+            num_threads=NUM_THREADS,
+            block_dim_count=BLOCK_DIM_COUNT,
+        ](a_shared, a_tile)
+        copy_dram_to_sram_async[
+            thread_layout=load_b_layout,
+            num_threads=NUM_THREADS,
+            block_dim_count=BLOCK_DIM_COUNT,
+        ](b_shared, b_tile)
+
+        # Wait for all async copies to complete
+        async_copy_wait_all()
+        barrier()
+
+        # Compute partial matrix multiplication for this tile
+        @parameter
+        for k in range(TPB):
+            acc += a_shared[local_row, k] * b_shared[k, local_col]
+
+        barrier()
+
+    # Write final result to output tile
+    if tiled_row < size and tiled_col < size:
+        out_tile[local_row, local_col] = acc
+    
 
 # ANCHOR_END: matmul_tiled
 
