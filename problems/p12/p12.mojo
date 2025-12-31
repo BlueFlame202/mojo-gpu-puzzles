@@ -20,8 +20,33 @@ fn dot_product(
     size: UInt,
 ):
     # FILL ME IN (roughly 13 lines)
-    ...
+    shared = stack_allocation[
+        TPB,
+        Scalar[dtype],
+        address_space = AddressSpace.SHARED
+    ]()
+    global_i = block_dim.x * block_idx.x + thread_idx.x
+    local_i = thread_idx.x
 
+    if global_i < size:
+        shared[local_i] = a[global_i] * b[global_i] # 2 global reads, 1 local write, 1 multiply
+    barrier()
+    
+    # if local_i == 0:
+    #     for j in range(1, SIZE):
+    #         shared[0] += shared[j] # 2 local reads, 1 local write, 1 add
+    #     output[0] = shared[0] # 1 local read, 1 global write
+    stride = UInt(TPB // 2)
+    while stride > 0: # because of this, many of the operations below are happening synchronously, as opposed to the above loop which only occurs once per block
+        if local_i < stride:
+            shared[local_i] += shared[local_i + stride] # 2 local reads, 1 local write, 1 add
+
+        barrier()
+        stride //= 2
+
+    # only thread 0 writes the final result
+    if local_i == 0:
+        output[0] = shared[0] # 1 local read, 1 global write
 
 # ANCHOR_END: dot_product
 
