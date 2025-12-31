@@ -26,7 +26,58 @@ fn softmax_gpu_kernel[
     input: LayoutTensor[dtype, layout, ImmutAnyOrigin],
 ):
     # FILL IN (roughly 31 lines)
-    ...
+    global_i = Int(block_dim.x * block_idx.x + thread_idx.x)
+    local_i = Int(thread_idx.x)
+
+    shared = LayoutTensor[
+        dtype, 
+        Layout.row_major(BLOCK_DIM_X),
+        MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ].stack_allocation()
+
+    if global_i < input_size:
+        shared[local_i] = input[global_i] # 1 global read per thread, but they operate simultaneously?
+    else:
+        shared[local_i] = input[0] # to ensure that we don't cause a problem with the max operation
+    barrier()
+    
+    # Stage 1: Max Reduction   
+    # idea: each thread looks at its neighbor and stores the max of the two in the left node
+    stride = 2
+    while stride <= SIZE:
+        if local_i % stride == 0:
+            # look at the guy to your right
+            if shared[local_i + stride//2] > shared[local_i]:
+                shared[local_i] = shared[local_i + stride//2]
+        barrier()
+        stride *= 2
+    # now shared[0] has the max element, but that means we need to restore
+
+    max_elem = shared[0]
+
+    # Stage 2: Sum Reduction
+    if global_i < input_size:
+        # numerical stability
+        shared[local_i] = exp(input[global_i] - max_elem) # 1 global read per thread, but they operate simultaneously?
+    else:
+        shared[local_i] = 0 # to ensure that we don't cause a problem with the sum operation
+    barrier()
+
+    # idea: each thread looks at its neighbor and stores the sum of the two in the left node
+    stride = 2
+    while stride <= SIZE:
+        if local_i % stride == 0:
+            # look at the guy to your right
+            shared[local_i] += shared[local_i + stride//2]
+        barrier()
+        stride *= 2
+    total = shared[0]
+
+    # Stage 3: Finish output
+    if global_i < input_size:
+        # numerical stability
+        output[global_i] = exp(input[global_i] - max_elem) / total # 1 global read per thread, but they operate simultaneously?
 
 
 # ANCHOR_END: softmax_gpu_kernel
@@ -42,7 +93,18 @@ fn softmax_cpu_kernel[
     input: LayoutTensor[dtype, layout, ImmutAnyOrigin],
 ):
     # FILL IN (roughly 10 lines)
-    ...
+    # I wonder if there's a better idiomatic way to do this like with LayoutTensor
+    var max_in : output.element_type = input[0]
+    for i in range(1, input_size):
+        if input[i] > max_in:
+            max_in = input[i]
+
+    var total : output.element_type = 0
+    for i in range(input_size):
+        total += exp(input[i] - max_in)
+    
+    for i in range(input_size):
+        output[i] = exp(input[i] - max_in) / total
 
 
 # ANCHOR_END: softmax_cpu_kernel
