@@ -31,8 +31,12 @@ fn elementwise_add[
         simd_width: Int, rank: Int, alignment: Int = align_of[dtype]()
     ](indices: IndexList[rank]) capturing -> None:
         idx = indices[0]
-        print("idx:", idx)
+        # print("idx:", idx)
         # FILL IN (2 to 4 lines)
+        a_simd = a.aligned_load[simd_width](idx, 0)
+        b_simd = b.aligned_load[simd_width](idx, 0)
+        output.store[simd_width](idx, 0, a_simd+b_simd)
+
 
     elementwise[add, SIMD_WIDTH, target="gpu"](a.size(), ctx)
 
@@ -63,12 +67,17 @@ fn tiled_elementwise_add[
         simd_width: Int, rank: Int, alignment: Int = align_of[dtype]()
     ](indices: IndexList[rank]) capturing -> None:
         tile_id = indices[0]
-        print("tile_id:", tile_id)
+        # print("tile_id:", tile_id)
         output_tile = output.tile[tile_size](tile_id)
         a_tile = a.tile[tile_size](tile_id)
         b_tile = b.tile[tile_size](tile_id)
 
         # FILL IN (6 lines at most)
+        @parameter
+        for i in range(tile_size):
+            a_simd = a_tile.load[simd_width](i, 0)
+            b_simd = b_tile.load[simd_width](i, 0)
+            output_tile.store[simd_width](i, 0, a_simd+b_simd)
 
     num_tiles = (size + tile_size - 1) // tile_size
     elementwise[process_tiles, 1, target="gpu"](num_tiles, ctx)
@@ -101,12 +110,18 @@ fn manual_vectorized_tiled_elementwise_add[
         num_threads_per_tile: Int, rank: Int, alignment: Int = align_of[dtype]()
     ](indices: IndexList[rank]) capturing -> None:
         tile_id = indices[0]
-        print("tile_id:", tile_id)
+        # print("tile_id:", tile_id)
         output_tile = output.tile[chunk_size](tile_id)
         a_tile = a.tile[chunk_size](tile_id)
         b_tile = b.tile[chunk_size](tile_id)
 
         # FILL IN (7 lines at most)
+        @parameter
+        for i in range(tile_size):
+            global_start = tile_id * chunk_size + i * simd_width
+            a_vec = a.load[simd_width](global_start, 0)     # Load from global tensor
+            b_vec = b.load[simd_width](global_start, 0)
+            output.store[simd_width](global_start, 0, a_vec+b_vec)  # Store to global tensor
 
     # Number of tiles needed: each tile processes chunk_size elements
     num_tiles = (size + chunk_size - 1) // chunk_size
@@ -143,18 +158,29 @@ fn vectorize_within_tiles_elementwise_add[
         tile_start = tile_id * tile_size
         tile_end = min(tile_start + tile_size, size)
         actual_tile_size = tile_end - tile_start
-        print(
-            "tile_id:",
-            tile_id,
-            "tile_start:",
-            tile_start,
-            "tile_end:",
-            tile_end,
-            "actual_tile_size:",
-            actual_tile_size,
-        )
+        # print(
+        #     "tile_id:",
+        #     tile_id,
+        #     "tile_start:",
+        #     tile_start,
+        #     "tile_end:",
+        #     tile_end,
+        #     "actual_tile_size:",
+        #     actual_tile_size,
+        # )
 
         # FILL IN (9 lines at most)
+        fn vectorized_add[
+            width: Int
+        ](i: Int) unified {read tile_start, read a, read b, mut output}:
+            global_idx = tile_start + i
+            if global_idx + width <= size:  # Bounds checking
+                # SIMD operations here
+                a_vec = a.load[simd_width](global_idx, 0)     # Load from global tensor
+                b_vec = b.load[simd_width](global_idx, 0)
+                output.store[simd_width](global_idx, 0, a_vec+b_vec)
+
+        vectorize[simd_width](actual_tile_size, vectorized_add)
 
     num_tiles = (size + tile_size - 1) // tile_size
     elementwise[
